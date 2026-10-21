@@ -9,11 +9,13 @@ import sys
 import time
 import tkinter as tk
 from ctypes import wintypes
-from tkinter import font as tkfont
+from tkinter import messagebox
 
 from . import __version__
 from .hook import KeyboardHook, is_key_down
 from .keys import KeyState
+from .launcher import QUIT_HINT, ask_start, load_settings, save_settings
+from .render import DEFAULT_THEME, THEMES, draw_combo
 
 QUIT_LABELS = ["Ctrl", "Alt", "Shift", "Q"]
 POLL_MS = 15
@@ -23,11 +25,6 @@ FADE_STEPS = 8
 FADE_STEP_MS = 25
 
 COLORKEY = "#010203"  # painted pixels in this color become fully transparent
-PANEL_BG = "#1E1E1E"
-KEYCAP_BG = "#3A3A3A"
-KEYCAP_EDGE = "#5A5A5A"
-TEXT_FG = "#FFFFFF"
-PLUS_FG = "#A0A0A0"
 
 GWL_EXSTYLE = -20
 WS_EX_TRANSPARENT = 0x00000020
@@ -78,21 +75,14 @@ def primary_work_area() -> tuple[int, int, int, int]:
     return rect.left, rect.top, rect.right, rect.bottom
 
 
-def round_rect(canvas: tk.Canvas, x1, y1, x2, y2, r, **kw) -> int:
-    pts = [x1 + r, y1, x2 - r, y1, x2, y1, x2, y1 + r, x2, y2 - r, x2, y2,
-           x2 - r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y1 + r, x1, y1]
-    return canvas.create_polygon(pts, smooth=True, **kw)
-
-
 class Overlay:
-    def __init__(self, root: tk.Tk, hook: KeyboardHook, args: argparse.Namespace) -> None:
+    def __init__(self, root: tk.Tk, hook: KeyboardHook, args: argparse.Namespace, scale: float) -> None:
         self.root = root
         self.hook = hook
         self.args = args
+        self.scale = scale
         self.state = KeyState()
-        self.scale = root.winfo_fpixels("1i") / 96
-        self.font = tkfont.Font(family="Segoe UI Semibold", size=args.font_size)
-        self.plus_font = tkfont.Font(family="Segoe UI", size=max(8, args.font_size - 4))
+        self.theme = THEMES[args.theme]
         self.hide_job: str | None = None
         self.fade_job: str | None = None
         self.last_prune = time.monotonic()
@@ -105,13 +95,14 @@ class Overlay:
         self.canvas = tk.Canvas(root, bg=COLORKEY, highlightthickness=0, bd=0)
         self.canvas.pack()
         root.geometry("1x1+0+0")
+        root.deiconify()
         root.update_idletasks()
         self.hwnd = user32.GetAncestor(root.winfo_id(), GA_ROOT)
         self._apply_window_styles()
-        root.after(POLL_MS, self._poll)
-
-    def px(self, value: float) -> int:
-        return round(value * self.scale)
+        if args.preview:
+            root.after(100, lambda: self.show([part.strip() for part in args.preview.split("+")]))
+        else:
+            root.after(POLL_MS, self._poll)
 
     def _apply_window_styles(self) -> None:
         style = user32.GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)
@@ -153,27 +144,9 @@ class Overlay:
 
     def show(self, labels: list[str]) -> None:
         self._cancel_jobs()
-        c = self.canvas
-        c.delete("all")
-        pad, gap, cap_px, cap_py = self.px(10), self.px(8), self.px(12), self.px(6)
-        text_h = self.font.metrics("linespace")
-        cap_h = text_h + 2 * cap_py
-        x = pad
-        for i, label in enumerate(labels):
-            if i:
-                c.create_text(x, pad + cap_h / 2, text="+", font=self.plus_font, fill=PLUS_FG, anchor="w")
-                x += self.plus_font.measure("+") + gap
-            cap_w = max(cap_h, self.font.measure(label) + 2 * cap_px)
-            round_rect(c, x, pad, x + cap_w, pad + cap_h, self.px(8), fill=KEYCAP_BG, outline=KEYCAP_EDGE)
-            c.create_text(x + cap_w / 2, pad + cap_h / 2, text=label, font=self.font, fill=TEXT_FG)
-            x += cap_w + gap
-        width, height = x - gap + pad, cap_h + 2 * pad
-        panel = round_rect(c, 0, 0, width, height, self.px(12), fill=PANEL_BG, outline=PANEL_BG)
-        c.tag_lower(panel)
-        c.configure(width=width, height=height)
-
+        width, height = draw_combo(self.canvas, labels, self.theme, self.args.font_size, self.scale)
         left, _, _, bottom = primary_work_area()
-        margin = self.px(self.args.margin)
+        margin = round(self.args.margin * self.scale)
         self.root.geometry(f"{width}x{height}+{left + margin}+{bottom - margin - height}")
         self.root.attributes("-alpha", self.args.opacity)
         self._apply_window_styles()
@@ -208,8 +181,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--hold", type=float, default=1.5, help="seconds to keep showing after release (default 1.5)")
     p.add_argument("--margin", type=int, default=24, help="distance from screen edge in px (default 24)")
     p.add_argument("--opacity", type=float, default=0.92, help="0.1-1.0 (default 0.92)")
-    p.add_argument("--combos-only", action="store_true",
+    p.add_argument("--theme", choices=sorted(THEMES),
+                   help=f"color theme (default: last choice, else {DEFAULT_THEME})")
+    p.add_argument("--combos-only", action="store_true", default=None,
                    help="only show when Ctrl/Alt/Win is held, so plain typing (e.g. passwords) is never displayed")
+    p.add_argument("--no-dialog", action="store_true",
+                   help="skip the start-up dialog (for auto-start); uses the last saved choice")
+    p.add_argument("--preview", metavar="COMBO",
+                   help='only draw this combo, without hooking the keyboard, e.g. "Ctrl+Shift+Z" (theme preview)')
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = p.parse_args(argv)
     args.opacity = min(1.0, max(0.1, args.opacity))
@@ -218,23 +197,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    mutex = acquire_single_instance()
-    if mutex is None:
-        return 0  # already running
-
     enable_dpi_awareness()
-    hook = KeyboardHook()
-    hook.start()
-    hook.ready.wait(5)
     root = tk.Tk()
     root.title("Key Overlay")
-    if hook.error is not None or not hook.ready.is_set():
-        from tkinter import messagebox
-        root.withdraw()
-        messagebox.showerror("Key Overlay", f"無法安裝鍵盤 hook（Win32 error {hook.error}）。")
-        return 1
+    root.withdraw()
+    scale = root.winfo_fpixels("1i") / 96
 
-    Overlay(root, hook, args)
+    mutex = acquire_single_instance()
+    if mutex is None:
+        if not args.no_dialog:
+            messagebox.showinfo("Key Overlay", f"Key Overlay 已經在執行中。\n\n要關閉請按 {QUIT_HINT}。")
+        return 0
+
+    saved = load_settings()
+    if args.theme is None:
+        args.theme = saved.get("theme") if saved.get("theme") in THEMES else DEFAULT_THEME
+    if args.combos_only is None:
+        args.combos_only = bool(saved.get("combos_only", False))
+
+    if not args.no_dialog and not args.preview:
+        choice = ask_start(root, args.theme, args.combos_only, scale)
+        if choice is None:
+            return 0
+        args.theme, args.combos_only = choice["theme"], choice["combos_only"]
+        save_settings(choice)
+
+    hook = KeyboardHook()
+    if not args.preview:
+        hook.start()
+        hook.ready.wait(5)
+        if hook.error is not None or not hook.ready.is_set():
+            messagebox.showerror("Key Overlay", f"無法安裝鍵盤 hook（Win32 error {hook.error}）。")
+            return 1
+
+    Overlay(root, hook, args, scale)
     root.mainloop()
     return 0
 

@@ -10,6 +10,7 @@
 
 - 純 Python 標準函式庫（`ctypes` 掛 `WH_KEYBOARD_LL` 全域 hook + `tkinter`），零第三方依賴
 - 置頂、滑鼠可穿透、不搶焦點、不出現在工作列
+- 啟動時跳出設定視窗：確認是否開始、挑顯示顏色（亮黃／亮藍／亮白，附實際效果預覽）、提示關閉方式；選擇會記在 `%APPDATA%\KeyOverlay\settings.json`
 - 只顯示當下一筆組合；所有鍵放開後停留 1.5 秒再淡出
 - 修飾鍵固定排序 `Win → Ctrl → Alt → Shift`，左右 Ctrl/Shift/Alt 合併顯示
 - 單一實例：重複開啟不會出現第二個
@@ -18,9 +19,10 @@
 
 1. 到 [Releases](../../releases) 下載 `KeyOverlay.exe`
 2. 雙擊執行。第一次開啟若出現 SmartScreen「Windows 已保護您的電腦」→ 點「其他資訊」→「仍要執行」（exe 沒有程式碼簽章）
-3. 結束程式：按 **`Ctrl + Alt + Shift + Q`**（或在工作管理員結束 `KeyOverlay.exe`）
+3. 在設定視窗選顏色 →「開始執行」（按「取消」則不會啟動任何東西）
+4. 結束程式：按 **`Ctrl + Alt + Shift + Q`**（或在工作管理員結束 `KeyOverlay.exe`）。程式已在執行時再開一次，會提示關閉方式
 
-開機自動啟動：`Win + R` → 輸入 `shell:startup` → 把 `KeyOverlay.exe` 的捷徑放進去。
+開機自動啟動：`Win + R` → 輸入 `shell:startup` → 放一個 `KeyOverlay.exe` 的捷徑，並在捷徑「目標」後面空一格加上 `--no-dialog`，開機時就不會跳設定視窗、直接沿用上次的選擇。
 
 ## 參數
 
@@ -30,7 +32,10 @@
 | `--hold SEC` | 1.5 | 放開後停留秒數 |
 | `--margin PX` | 24 | 與螢幕邊緣距離 |
 | `--opacity 0.1~1.0` | 0.92 | 不透明度 |
-| `--combos-only` | 關 | 只在按住 Ctrl/Alt/Win 時顯示，一般打字（含密碼）不會出現在畫面上 |
+| `--theme yellow\|blue\|white` | 上次的選擇，否則 `yellow` | 顯示顏色 |
+| `--combos-only` | 上次的選擇，否則關 | 只在按住 Ctrl/Alt/Win 時顯示，一般打字（含密碼）不會出現在畫面上 |
+| `--no-dialog` | 關 | 不跳設定視窗，直接啟動（給開機自動啟動用） |
+| `--preview "Ctrl+Shift+Z"` | — | 只畫出指定組合、不掛鍵盤 hook（開發時看配色用，需從工作管理員結束） |
 
 exe 也吃同樣的參數，可在捷徑的「目標」後面加，例如 `KeyOverlay.exe --combos-only --font-size 16`。
 
@@ -47,9 +52,11 @@ python -m unittest discover -s tests -v
 
 ```
 key_overlay/
-  keys.py   VK 代碼 → 顯示名稱、按住狀態（純邏輯，有單元測試）
-  hook.py   WH_KEYBOARD_LL hook thread，事件丟進 queue
-  app.py    tkinter overlay、視窗樣式、CLI 參數
+  keys.py      VK 代碼 → 顯示名稱、按住狀態（純邏輯，有單元測試）
+  hook.py      WH_KEYBOARD_LL hook thread，事件丟進 queue
+  render.py    配色主題與鍵帽繪製（overlay 與設定視窗共用）
+  launcher.py  啟動設定視窗、settings.json 讀寫
+  app.py       tkinter overlay、視窗樣式、CLI 參數、啟動流程
 ```
 
 ## 發佈新版
