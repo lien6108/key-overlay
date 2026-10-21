@@ -18,7 +18,7 @@ from .hook import KeyboardHook, is_key_down
 from .keys import KeyState
 from .launcher import QUIT_HINT, ask_start, load_settings, save_settings
 from .render import DEFAULT_THEME, THEMES, draw_combo
-from .tray import ICON_PATH, TrayIcon
+from .tray import ICON_PATH, TRAY_STARTUP_TIMEOUT_S, TrayIcon
 
 QUIT_LABELS = ["Ctrl", "Alt", "Shift", "Q"]
 QUIT_EVENT = None  # queued by the tray menu alongside (vk, is_down) tuples
@@ -270,6 +270,16 @@ def main(argv: list[str] | None = None) -> int:
                     [f"Key Overlay {__version__} 執行中", f"快捷鍵 {QUIT_HINT} 也可結束"],
                     on_quit=lambda: hook.events.put(QUIT_EVENT))
     tray.start()
+    if not tray.ready.wait(TRAY_STARTUP_TIMEOUT_S):
+        hook.stop()
+        tray.stop()
+        messagebox.showerror("Key Overlay", "通知區域圖示啟動逾時，請確認 Windows 檔案總管正在執行。")
+        return 1
+    if tray.error is not None:
+        hook.stop()
+        tray.stop()
+        messagebox.showerror("Key Overlay", f"無法建立右下角圖示：{tray.error}")
+        return 1
     Overlay(root, hook, tray, args, scale)
     root.mainloop()
     return 0

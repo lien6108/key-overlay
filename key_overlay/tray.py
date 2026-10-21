@@ -28,7 +28,6 @@ TPM_RIGHTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD = 0x0002, 0x0080, 0x0100
 IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x0010
 SM_CXSMICON, SM_CYSMICON = 49, 50
-IDI_APPLICATION = 32512
 CMD_QUIT = 1
 
 LRESULT = ctypes.c_ssize_t
@@ -66,9 +65,7 @@ user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 user32.RegisterWindowMessageW.restype = wintypes.UINT
 user32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT, ctypes.c_int,
                               ctypes.c_int, wintypes.UINT]
-user32.LoadImageW.restype = wintypes.HANDLE
-user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPVOID]
-user32.LoadIconW.restype = wintypes.HICON
+user32.LoadImageW.restype = wintypes.HICON
 user32.CreatePopupMenu.restype = wintypes.HMENU
 user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
 user32.TrackPopupMenu.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -82,15 +79,30 @@ user32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
 user32.DestroyWindow.argtypes = [wintypes.HWND]
 user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
 user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.DestroyIcon.argtypes = [wintypes.HICON]
+user32.DestroyIcon.restype = wintypes.BOOL
 shell32.Shell_NotifyIconW.argtypes = [wintypes.DWORD, ctypes.POINTER(NOTIFYICONDATAW)]
+shell32.Shell_NotifyIconW.restype = wintypes.BOOL
 kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
 kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
+NIM_SETVERSION = 4
+NOTIFYICON_VERSION_4 = 4
+TRAY_ADD_RETRIES = 20
+TRAY_ADD_RETRY_DELAY_S = 0.25
+TRAY_STARTUP_TIMEOUT_S = TRAY_ADD_RETRIES * TRAY_ADD_RETRY_DELAY_S + 1
 
-def load_small_icon():
+
+def load_small_icon() -> wintypes.HICON:
+    if not ICON_PATH.is_file():
+        raise FileNotFoundError(f"Tray icon asset not found: {ICON_PATH}")
+
     icon = user32.LoadImageW(None, str(ICON_PATH), IMAGE_ICON, user32.GetSystemMetrics(SM_CXSMICON),
                              user32.GetSystemMetrics(SM_CYSMICON), LR_LOADFROMFILE)
-    return icon or user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+    if not icon:
+        error = ctypes.get_last_error()
+        raise OSError(error, f"Unable to load tray icon: {ICON_PATH}")
+    return icon
 
 
 class TrayIcon(threading.Thread):
@@ -103,25 +115,42 @@ class TrayIcon(threading.Thread):
         self.on_quit = on_quit
         self.hwnd = None
         self.added = False
+        self.ready = threading.Event()
+        self.error: Exception | None = None
+        self._stop_requested = threading.Event()
         self._proc = WNDPROC(self._wndproc)  # keep a reference so it is not GC'd
         self._taskbar_created = user32.RegisterWindowMessageW("TaskbarCreated")
         self._nid = NOTIFYICONDATAW()
 
     def run(self) -> None:
-        hinst = kernel32.GetModuleHandleW(None)
-        wc = WNDCLASSW(lpfnWndProc=self._proc, hInstance=hinst, lpszClassName="KeyOverlayTray")
-        user32.RegisterClassW(ctypes.byref(wc))
-        self.hwnd = user32.CreateWindowExW(0, "KeyOverlayTray", "Key Overlay", 0, 0, 0, 0, 0,
-                                           None, None, hinst, None)
-        nid = self._nid
-        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        nid.hWnd = self.hwnd
-        nid.uID = 1
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-        nid.uCallbackMessage = WM_TRAY
-        nid.hIcon = load_small_icon()
-        nid.szTip = self.tooltip[:127]
-        self.added = bool(shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid)))
+        try:
+            hinst = kernel32.GetModuleHandleW(None)
+            wc = WNDCLASSW(lpfnWndProc=self._proc, hInstance=hinst, lpszClassName="KeyOverlayTray")
+            if not user32.RegisterClassW(ctypes.byref(wc)) and ctypes.get_last_error() != 1410:
+                raise ctypes.WinError()
+            self.hwnd = user32.CreateWindowExW(0, "KeyOverlayTray", "Key Overlay", 0, 0, 0, 0, 0,
+                                               None, None, hinst, None)
+            if not self.hwnd:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            nid = self._nid
+            nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
+            nid.hWnd = self.hwnd
+            nid.uID = 1
+            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
+            nid.uCallbackMessage = WM_TRAY
+            nid.hIcon = load_small_icon()
+            nid.szTip = self.tooltip[:127]
+            self.added = self._add_icon_with_retry()
+            if not self.added:
+                raise RuntimeError("Windows notification area did not accept the Key Overlay icon")
+        except Exception as error:
+            self.error = error
+        finally:
+            self.ready.set()
+
+        if self.error is not None:
+            return
 
         msg = wintypes.MSG()
         while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -129,8 +158,27 @@ class TrayIcon(threading.Thread):
             user32.DispatchMessageW(ctypes.byref(msg))
 
     def stop(self) -> None:
+        self._stop_requested.set()
         if self.hwnd:
             user32.PostMessageW(self.hwnd, WM_CLOSE, 0, 0)
+
+    def _add_icon_once(self) -> bool:
+        self._nid.uVersion = NOTIFYICON_VERSION_4
+        if not shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid)):
+            return False
+
+        # Set the modern callback behavior for every icon added to the shell.
+        shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(self._nid))
+        return True
+
+    def _add_icon_with_retry(self) -> bool:
+        for attempt in range(TRAY_ADD_RETRIES):
+            if self._add_icon_once():
+                return True
+            if attempt + 1 < TRAY_ADD_RETRIES:
+                if self._stop_requested.wait(TRAY_ADD_RETRY_DELAY_S):
+                    return False
+        return False
 
     def _show_menu(self) -> None:
         menu = user32.CreatePopupMenu()
@@ -153,10 +201,12 @@ class TrayIcon(threading.Thread):
             self._show_menu()
             return 0
         if msg == self._taskbar_created:  # Explorer restarted: re-add the icon
-            shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(self._nid))
+            self.added = self._add_icon_with_retry()
             return 0
         if msg == WM_DESTROY:
-            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
+            if self.added:
+                shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
+                self.added = False
             user32.PostQuitMessage(0)
             return 0
         return user32.DefWindowProcW(hwnd, msg, w_param, l_param)
