@@ -5,6 +5,8 @@ Set-Location $PSScriptRoot
 python -m pip install --disable-pip-version-check -q -r requirements-dev.txt
 python -m PyInstaller --noconfirm --clean --onefile --noconsole `
     --name KeyOverlay `
+    --icon key_overlay/assets/icon.ico `
+    --add-data "key_overlay/assets/icon.ico;key_overlay/assets" `
     KeyOverlay.pyw
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed" }
 

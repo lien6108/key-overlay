@@ -63,9 +63,11 @@ def ask_start(root: tk.Tk, theme: str, combos_only: bool, scale: float) -> dict 
 
     quit_box = ttk.LabelFrame(body, text=" 如何關閉 ", padding=round(10 * scale))
     quit_box.pack(fill="x", pady=(0, 16))
-    ttk.Label(quit_box, text=f"任何時候按下  {QUIT_HINT}  即可結束程式。",
+    ttk.Label(quit_box, text=f"方法一：任何時候按下  {QUIT_HINT}",
               font=("Microsoft JhengHei UI", 10, "bold")).pack(anchor="w")
-    ttk.Label(quit_box, text="也可以在工作管理員中結束 KeyOverlay.exe。",
+    ttk.Label(quit_box, text="方法二：在螢幕右下角通知區域的黃色 K 圖示上按右鍵 →「結束 Key Overlay」",
+              font=("Microsoft JhengHei UI", 10, "bold")).pack(anchor="w", pady=(4, 0))
+    ttk.Label(quit_box, text="（圖示沒看到的話，點工作列右側的 ^ 展開隱藏的圖示）",
               font=("Microsoft JhengHei UI", 9)).pack(anchor="w", pady=(2, 0))
 
     def start(_event=None) -> None:

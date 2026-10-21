@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import ctypes
 import queue
 import sys
+import threading
 import time
 import tkinter as tk
 from ctypes import wintypes
@@ -16,10 +18,11 @@ from .hook import KeyboardHook, is_key_down
 from .keys import KeyState
 from .launcher import QUIT_HINT, ask_start, load_settings, save_settings
 from .render import DEFAULT_THEME, THEMES, draw_combo
+from .tray import ICON_PATH, TrayIcon
 
 QUIT_LABELS = ["Ctrl", "Alt", "Shift", "Q"]
-POLL_MS = 15
-PRUNE_EVERY_S = 1.0
+QUIT_EVENT = None  # queued by the tray menu alongside (vk, is_down) tuples
+PRUNE_EVERY_MS = 1000
 PRUNE_MIN_AGE_S = 1.0
 FADE_STEPS = 8
 FADE_STEP_MS = 25
@@ -75,17 +78,39 @@ def primary_work_area() -> tuple[int, int, int, int]:
     return rect.left, rect.top, rect.right, rect.bottom
 
 
+class EventRelay(threading.Thread):
+    """Blocks on the input queue and wakes the Tk thread only when something arrives,
+    so the UI thread sleeps while idle instead of polling."""
+
+    def __init__(self, root: tk.Tk, source: queue.SimpleQueue) -> None:
+        super().__init__(name="event-relay", daemon=True)
+        self.root = root
+        self.source = source
+        self.pending: collections.deque = collections.deque()
+
+    def run(self) -> None:
+        while True:
+            self.pending.append(self.source.get())
+            try:
+                self.root.event_generate("<<Input>>", when="tail")
+            except (RuntimeError, tk.TclError):
+                return  # UI is gone
+
+
 class Overlay:
-    def __init__(self, root: tk.Tk, hook: KeyboardHook, args: argparse.Namespace, scale: float) -> None:
+    def __init__(self, root: tk.Tk, hook: KeyboardHook, tray: TrayIcon,
+                 args: argparse.Namespace, scale: float) -> None:
         self.root = root
         self.hook = hook
+        self.tray = tray
         self.args = args
         self.scale = scale
         self.state = KeyState()
         self.theme = THEMES[args.theme]
         self.hide_job: str | None = None
         self.fade_job: str | None = None
-        self.last_prune = time.monotonic()
+        self.prune_job: str | None = None
+        self.relay = EventRelay(root, hook.events)
 
         root.overrideredirect(True)
         root.configure(bg=COLORKEY)
@@ -99,36 +124,31 @@ class Overlay:
         root.update_idletasks()
         self.hwnd = user32.GetAncestor(root.winfo_id(), GA_ROOT)
         self._apply_window_styles()
+        root.bind("<<Input>>", self._on_input)
+        root.after(0, self.relay.start)  # start once mainloop runs, so cross-thread calls are accepted
         if args.preview:
             root.after(100, lambda: self.show([part.strip() for part in args.preview.split("+")]))
-        else:
-            root.after(POLL_MS, self._poll)
 
     def _apply_window_styles(self) -> None:
         style = user32.GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)
         style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
         user32.SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, style)
 
-    def _poll(self) -> None:
+    def _on_input(self, _event=None) -> None:
         now = time.monotonic()
         changed = False
         released = False
-        try:
-            while True:
-                vk, is_down = self.hook.events.get_nowait()
-                if is_down:
-                    changed |= self.state.press(vk, now)
-                else:
-                    self.state.release(vk)
-                    released = True
-        except queue.Empty:
-            pass
-
-        if now - self.last_prune >= PRUNE_EVERY_S:
-            self.last_prune = now
-            had_keys = not self.state.empty()
-            self.state.prune(is_key_down, now, PRUNE_MIN_AGE_S)
-            released |= had_keys and self.state.empty()
+        while self.relay.pending:
+            item = self.relay.pending.popleft()
+            if item is QUIT_EVENT:
+                self.quit()
+                return
+            vk, is_down = item
+            if is_down:
+                changed |= self.state.press(vk, now)
+            else:
+                self.state.release(vk)
+                released = True
 
         if changed:
             labels = self.state.labels()
@@ -139,8 +159,19 @@ class Overlay:
                 self.show(labels)
         if released and self.state.empty():
             self._schedule_hide()
+        if not self.state.empty() and self.prune_job is None:
+            self.prune_job = self.root.after(PRUNE_EVERY_MS, self._prune_tick)
 
-        self.root.after(POLL_MS, self._poll)
+    def _prune_tick(self) -> None:
+        """Runs only while keys are held, to recover from key-ups Windows never delivered."""
+        self.prune_job = None
+        if self.state.empty():
+            return
+        self.state.prune(is_key_down, time.monotonic(), PRUNE_MIN_AGE_S)
+        if self.state.empty():
+            self._schedule_hide()
+        else:
+            self.prune_job = self.root.after(PRUNE_EVERY_MS, self._prune_tick)
 
     def show(self, labels: list[str]) -> None:
         self._cancel_jobs()
@@ -172,6 +203,7 @@ class Overlay:
 
     def quit(self) -> None:
         self.hook.stop()
+        self.tray.stop()
         self.root.destroy()
 
 
@@ -201,6 +233,10 @@ def main(argv: list[str] | None = None) -> int:
     root = tk.Tk()
     root.title("Key Overlay")
     root.withdraw()
+    try:
+        root.iconbitmap(default=str(ICON_PATH))
+    except tk.TclError:
+        pass
     scale = root.winfo_fpixels("1i") / 96
 
     mutex = acquire_single_instance()
@@ -230,7 +266,11 @@ def main(argv: list[str] | None = None) -> int:
             messagebox.showerror("Key Overlay", f"無法安裝鍵盤 hook（Win32 error {hook.error}）。")
             return 1
 
-    Overlay(root, hook, args, scale)
+    tray = TrayIcon(f"Key Overlay {__version__}（按右鍵可結束）",
+                    [f"Key Overlay {__version__} 執行中", f"快捷鍵 {QUIT_HINT} 也可結束"],
+                    on_quit=lambda: hook.events.put(QUIT_EVENT))
+    tray.start()
+    Overlay(root, hook, tray, args, scale)
     root.mainloop()
     return 0
 
