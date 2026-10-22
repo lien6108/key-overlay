@@ -5,13 +5,17 @@ from __future__ import annotations
 import tkinter as tk
 from tkinter import font as tkfont
 
+# keycap/edge/text: a pressed key. idle/idle_edge/idle_text: an unpressed key on the virtual keyboard.
 THEMES = {
     "yellow": {"name": "亮黃", "panel": "#111111", "keycap": "#FFD60A", "edge": "#FFE866",
-               "text": "#111111", "plus": "#FFD60A"},
+               "text": "#111111", "plus": "#FFD60A",
+               "idle": "#2A2A2A", "idle_edge": "#3C3C3C", "idle_text": "#C8C8C8"},
     "blue": {"name": "亮藍", "panel": "#0B1E3F", "keycap": "#2F80ED", "edge": "#6FA8FF",
-             "text": "#FFFFFF", "plus": "#6FA8FF"},
+             "text": "#FFFFFF", "plus": "#6FA8FF",
+             "idle": "#16305A", "idle_edge": "#244478", "idle_text": "#C8D6F0"},
     "white": {"name": "亮白", "panel": "#111111", "keycap": "#FFFFFF", "edge": "#FFFFFF",
-              "text": "#111111", "plus": "#FFFFFF"},
+              "text": "#111111", "plus": "#FFFFFF",
+              "idle": "#2A2A2A", "idle_edge": "#3C3C3C", "idle_text": "#C8C8C8"},
 }
 DEFAULT_THEME = "yellow"
 

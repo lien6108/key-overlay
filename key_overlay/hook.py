@@ -53,7 +53,8 @@ class KeyboardHook(threading.Thread):
 
     def __init__(self) -> None:
         super().__init__(name="keyboard-hook", daemon=True)
-        self.events: queue.SimpleQueue[tuple[int, bool]] = queue.SimpleQueue()
+        # (vk, is_down) tuples from the hook; the app also queues its own TrayCommand items here.
+        self.events: queue.SimpleQueue = queue.SimpleQueue()
         self.ready = threading.Event()
         self.error: int | None = None
         self._thread_id = 0

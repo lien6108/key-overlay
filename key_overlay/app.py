@@ -1,4 +1,5 @@
-"""Bottom-left on-screen overlay showing the key combination currently being pressed."""
+"""On-screen overlay showing the key combination currently being pressed, plus an optional
+virtual keyboard that lights up held keys. Both sit in a screen corner of the user's choice."""
 
 from __future__ import annotations
 
@@ -12,47 +13,35 @@ import time
 import tkinter as tk
 from ctypes import wintypes
 from tkinter import messagebox
+from typing import NamedTuple
 
 from . import __version__
 from .hook import KeyboardHook, is_key_down
+from .keyboard import VirtualKeyboard
 from .keys import KeyState
 from .launcher import QUIT_HINT, ask_start, load_settings, save_settings
+from .layout import DEFAULT_POSITION, POSITIONS, corner_origin
 from .render import DEFAULT_THEME, THEMES, draw_combo
 from .tray import ICON_PATH, TRAY_STARTUP_TIMEOUT_S, TrayIcon
+from .winapi import COLORKEY, place_window, prepare_overlay_window, primary_work_area
 
 QUIT_LABELS = ["Ctrl", "Alt", "Shift", "Q"]
-QUIT_EVENT = None  # queued by the tray menu alongside (vk, is_down) tuples
 PRUNE_EVERY_MS = 1000
 PRUNE_MIN_AGE_S = 1.0
 FADE_STEPS = 8
 FADE_STEP_MS = 25
-
-COLORKEY = "#010203"  # painted pixels in this color become fully transparent
-
-GWL_EXSTYLE = -20
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_LAYERED = 0x00080000
-WS_EX_NOACTIVATE = 0x08000000
-GA_ROOT = 2
-HWND_TOPMOST = -1
-SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
-SPI_GETWORKAREA = 0x0030
+STACK_GAP_PX = 8  # space between the virtual keyboard and the combo panel
 ERROR_ALREADY_EXISTS = 183
 
-user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
-user32.GetAncestor.restype = wintypes.HWND
-user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
-user32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
-user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
-user32.SetWindowLongPtrW.restype = ctypes.c_ssize_t
-user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
-user32.SystemParametersInfoW.argtypes = [wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT]
 kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
 kernel32.CreateMutexW.restype = wintypes.HANDLE
+
+
+class TrayCommand(NamedTuple):
+    """Queued by the tray thread alongside the hook's (vk, is_down) tuples."""
+    name: str
+    value: str | None = None
 
 
 def enable_dpi_awareness() -> None:
@@ -60,7 +49,7 @@ def enable_dpi_awareness() -> None:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # per-monitor
     except (AttributeError, OSError):
         try:
-            user32.SetProcessDPIAware()
+            ctypes.windll.user32.SetProcessDPIAware()
         except (AttributeError, OSError):
             pass
 
@@ -70,12 +59,6 @@ def acquire_single_instance():
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         return None
     return handle
-
-
-def primary_work_area() -> tuple[int, int, int, int]:
-    rect = wintypes.RECT()
-    user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
-    return rect.left, rect.top, rect.right, rect.bottom
 
 
 class EventRelay(threading.Thread):
@@ -99,40 +82,34 @@ class EventRelay(threading.Thread):
 
 class Overlay:
     def __init__(self, root: tk.Tk, hook: KeyboardHook, tray: TrayIcon,
-                 args: argparse.Namespace, scale: float) -> None:
+                 args: argparse.Namespace, settings: dict, scale: float) -> None:
         self.root = root
         self.hook = hook
         self.tray = tray
         self.args = args
+        self.settings = settings  # persisted view: theme, combos_only, position, keyboard
         self.scale = scale
         self.state = KeyState()
         self.theme = THEMES[args.theme]
         self.hide_job: str | None = None
         self.fade_job: str | None = None
         self.prune_job: str | None = None
+        self.combo_size: tuple[int, int] | None = None  # size of the panel currently on screen
         self.relay = EventRelay(root, hook.events)
 
-        root.overrideredirect(True)
-        root.configure(bg=COLORKEY)
-        root.attributes("-transparentcolor", COLORKEY)
-        root.attributes("-topmost", True)
-        root.attributes("-alpha", 0.0)
+        self.hwnd = prepare_overlay_window(root)
         self.canvas = tk.Canvas(root, bg=COLORKEY, highlightthickness=0, bd=0)
         self.canvas.pack()
-        root.geometry("1x1+0+0")
-        root.deiconify()
-        root.update_idletasks()
-        self.hwnd = user32.GetAncestor(root.winfo_id(), GA_ROOT)
-        self._apply_window_styles()
+        self.keyboard = VirtualKeyboard(root, self.theme, args.font_size, scale, args.opacity)
+        if settings.get("keyboard"):
+            self._place_keyboard()
+
         root.bind("<<Input>>", self._on_input)
         root.after(0, self.relay.start)  # start once mainloop runs, so cross-thread calls are accepted
         if args.preview:
             root.after(100, lambda: self.show([part.strip() for part in args.preview.split("+")]))
 
-    def _apply_window_styles(self) -> None:
-        style = user32.GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE)
-        style |= WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        user32.SetWindowLongPtrW(self.hwnd, GWL_EXSTYLE, style)
+    # ----- input -----
 
     def _on_input(self, _event=None) -> None:
         now = time.monotonic()
@@ -140,9 +117,10 @@ class Overlay:
         released = False
         while self.relay.pending:
             item = self.relay.pending.popleft()
-            if item is QUIT_EVENT:
-                self.quit()
-                return
+            if isinstance(item, TrayCommand):
+                if not self._run_command(item):
+                    return  # quit
+                continue
             vk, is_down = item
             if is_down:
                 changed |= self.state.press(vk, now)
@@ -155,12 +133,13 @@ class Overlay:
             if labels == QUIT_LABELS:
                 self.quit()
                 return
-            if not self.args.combos_only or self.state.has_command_modifier():
+            if self.state.should_display(self.args.combos_only):
                 self.show(labels)
         if released and self.state.empty():
             self._schedule_hide()
         if not self.state.empty() and self.prune_job is None:
             self.prune_job = self.root.after(PRUNE_EVERY_MS, self._prune_tick)
+        self._refresh_keyboard()
 
     def _prune_tick(self) -> None:
         """Runs only while keys are held, to recover from key-ups Windows never delivered."""
@@ -172,16 +151,71 @@ class Overlay:
             self._schedule_hide()
         else:
             self.prune_job = self.root.after(PRUNE_EVERY_MS, self._prune_tick)
+        self._refresh_keyboard()
+
+    def _run_command(self, cmd: TrayCommand) -> bool:
+        """Apply a tray menu pick. Returns False once the app is quitting."""
+        if cmd.name == "quit":
+            self.quit()
+            return False
+        if cmd.name == "toggle_keyboard":
+            self._remember("keyboard", not self.keyboard.visible)
+            if self.keyboard.visible:
+                self.keyboard.hide()
+            else:
+                self._place_keyboard()
+            self._replace_combo()
+        elif cmd.name == "position" and cmd.value in POSITIONS:
+            self._remember("position", cmd.value)
+            if self.keyboard.visible:
+                self._place_keyboard()
+            self._replace_combo()
+        return True
+
+    def _remember(self, key: str, value) -> None:
+        """Persist one changed setting without turning this run's command-line flags into defaults."""
+        self.settings[key] = value
+        save_settings({**load_settings(), key: value})
+
+    # ----- placement -----
+
+    @property
+    def position(self) -> str:
+        return self.settings.get("position", DEFAULT_POSITION)
+
+    def _margin(self) -> int:
+        return round(self.args.margin * self.scale)
+
+    def _place_keyboard(self) -> None:
+        x, y = corner_origin(self.position, primary_work_area(),
+                             (self.keyboard.width, self.keyboard.height), self._margin())
+        self.keyboard.show_at(x, y)
+        self._refresh_keyboard()
+
+    def _combo_origin(self, size: tuple[int, int]) -> tuple[int, int]:
+        offset = self.keyboard.height + round(STACK_GAP_PX * self.scale) if self.keyboard.visible else 0
+        return corner_origin(self.position, primary_work_area(), size, self._margin(), offset)
+
+    def _replace_combo(self) -> None:
+        """Move the combo panel if one is on screen (position or keyboard visibility changed)."""
+        if self.combo_size is None:
+            return
+        x, y = self._combo_origin(self.combo_size)
+        place_window(self.root, self.hwnd, x, y, *self.combo_size)
+
+    def _refresh_keyboard(self) -> None:
+        if self.keyboard.visible:
+            self.keyboard.light(self.state.visible_vks(self.args.combos_only))
+
+    # ----- combo panel -----
 
     def show(self, labels: list[str]) -> None:
         self._cancel_jobs()
-        width, height = draw_combo(self.canvas, labels, self.theme, self.args.font_size, self.scale)
-        left, _, _, bottom = primary_work_area()
-        margin = round(self.args.margin * self.scale)
-        self.root.geometry(f"{width}x{height}+{left + margin}+{bottom - margin - height}")
+        size = draw_combo(self.canvas, labels, self.theme, self.args.font_size, self.scale)
+        self.combo_size = size
+        x, y = self._combo_origin(size)
         self.root.attributes("-alpha", self.args.opacity)
-        self._apply_window_styles()
-        user32.SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE)
+        place_window(self.root, self.hwnd, x, y, *size)
 
     def _schedule_hide(self) -> None:
         self._cancel_jobs()
@@ -194,6 +228,7 @@ class Overlay:
             self.fade_job = self.root.after(FADE_STEP_MS, lambda: self._fade(steps_left - 1))
         else:
             self.fade_job = None
+            self.combo_size = None
 
     def _cancel_jobs(self) -> None:
         for job in (self.hide_job, self.fade_job):
@@ -215,6 +250,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--opacity", type=float, default=0.92, help="0.1-1.0 (default 0.92)")
     p.add_argument("--theme", choices=sorted(THEMES),
                    help=f"color theme (default: last choice, else {DEFAULT_THEME})")
+    p.add_argument("--position", choices=list(POSITIONS),
+                   help=f"screen corner (default: last choice, else {DEFAULT_POSITION})")
+    p.add_argument("--keyboard", action="store_true", default=None,
+                   help="also show a small virtual keyboard that lights up held keys (default: last choice)")
     p.add_argument("--combos-only", action="store_true", default=None,
                    help="only show when Ctrl/Alt/Win is held, so plain typing (e.g. passwords) is never displayed")
     p.add_argument("--no-dialog", action="store_true",
@@ -225,6 +264,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args = p.parse_args(argv)
     args.opacity = min(1.0, max(0.1, args.opacity))
     return args
+
+
+def resolve_settings(args: argparse.Namespace, saved: dict) -> dict:
+    """Command-line flags win; otherwise the last saved choice; otherwise the default."""
+    theme = args.theme or saved.get("theme")
+    position = args.position or saved.get("position")
+    return {
+        "theme": theme if theme in THEMES else DEFAULT_THEME,
+        "position": position if position in POSITIONS else DEFAULT_POSITION,
+        "combos_only": bool(saved.get("combos_only", False)) if args.combos_only is None else True,
+        "keyboard": bool(saved.get("keyboard", False)) if args.keyboard is None else True,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -245,18 +296,14 @@ def main(argv: list[str] | None = None) -> int:
             messagebox.showinfo("Key Overlay", f"Key Overlay 已經在執行中。\n\n要關閉請按 {QUIT_HINT}。")
         return 0
 
-    saved = load_settings()
-    if args.theme is None:
-        args.theme = saved.get("theme") if saved.get("theme") in THEMES else DEFAULT_THEME
-    if args.combos_only is None:
-        args.combos_only = bool(saved.get("combos_only", False))
-
+    settings = resolve_settings(args, load_settings())
     if not args.no_dialog and not args.preview:
-        choice = ask_start(root, args.theme, args.combos_only, scale)
+        choice = ask_start(root, settings, scale)
         if choice is None:
             return 0
-        args.theme, args.combos_only = choice["theme"], choice["combos_only"]
-        save_settings(choice)
+        settings = choice
+        save_settings(settings)
+    args.theme, args.combos_only = settings["theme"], settings["combos_only"]
 
     hook = KeyboardHook()
     if not args.preview:
@@ -266,9 +313,10 @@ def main(argv: list[str] | None = None) -> int:
             messagebox.showerror("Key Overlay", f"無法安裝鍵盤 hook（Win32 error {hook.error}）。")
             return 1
 
-    tray = TrayIcon(f"Key Overlay {__version__}（按右鍵可結束）",
+    tray = TrayIcon(f"Key Overlay {__version__}（按右鍵開啟選單）",
                     [f"Key Overlay {__version__} 執行中", f"快捷鍵 {QUIT_HINT} 也可結束"],
-                    on_quit=lambda: hook.events.put(QUIT_EVENT))
+                    on_command=lambda name, value: hook.events.put(TrayCommand(name, value)),
+                    get_state=lambda: dict(settings))
     tray.start()
     if not tray.ready.wait(TRAY_STARTUP_TIMEOUT_S):
         hook.stop()
@@ -280,7 +328,7 @@ def main(argv: list[str] | None = None) -> int:
         tray.stop()
         messagebox.showerror("Key Overlay", f"無法建立右下角圖示：{tray.error}")
         return 1
-    Overlay(root, hook, tray, args, scale)
+    Overlay(root, hook, tray, args, settings, scale)
     root.mainloop()
     return 0
 

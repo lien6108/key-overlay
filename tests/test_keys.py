@@ -76,6 +76,26 @@ class KeyStateTest(unittest.TestCase):
         s.prune(lambda vk: False, now=1.0, min_age=1.0)
         self.assertEqual(s.labels(), ["Z"])
 
+    def test_held_vks_keeps_left_and_right_distinct(self):
+        state = KeyState()
+        state.press(0xA2)
+        state.press(0xA3)
+        state.press(0x41)
+        self.assertEqual(state.held_vks(), frozenset({0xA2, 0xA3, 0x41}))
+        state.release(0xA2)
+        self.assertEqual(state.held_vks(), frozenset({0xA3, 0x41}))
+
+    def test_combos_only_hides_plain_typing_from_panel_and_keyboard(self):
+        state = KeyState()
+        state.press(0x41)  # A
+        self.assertTrue(state.should_display(combos_only=False))
+        self.assertFalse(state.should_display(combos_only=True))
+        self.assertEqual(state.visible_vks(combos_only=False), frozenset({0x41}))
+        self.assertEqual(state.visible_vks(combos_only=True), frozenset())
+        state.press(0xA2)  # LCtrl
+        self.assertTrue(state.should_display(combos_only=True))
+        self.assertEqual(state.visible_vks(combos_only=True), frozenset({0x41, 0xA2}))
+
     def test_command_modifier(self):
         s = KeyState()
         s.press(VK_LSHIFT)

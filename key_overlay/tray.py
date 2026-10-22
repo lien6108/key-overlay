@@ -1,4 +1,6 @@
-"""Notification-area (system tray) icon with a right-click menu to quit, on its own thread."""
+"""Notification-area (system tray) icon with a right-click menu, on its own thread.
+
+Menu picks are reported through `on_command(name, value)` from the tray thread."""
 
 from __future__ import annotations
 
@@ -7,6 +9,8 @@ import threading
 from ctypes import wintypes
 from pathlib import Path
 from typing import Callable
+
+from .layout import POSITIONS
 
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32", use_last_error=True)
@@ -23,12 +27,14 @@ WM_APP = 0x8000
 WM_TRAY = WM_APP + 1
 NIM_ADD, NIM_DELETE = 0, 2
 NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
-MF_STRING, MF_GRAYED, MF_SEPARATOR = 0x0, 0x1, 0x800
+MF_STRING, MF_GRAYED, MF_CHECKED, MF_POPUP, MF_SEPARATOR = 0x0, 0x1, 0x8, 0x10, 0x800
 TPM_RIGHTBUTTON, TPM_NONOTIFY, TPM_RETURNCMD = 0x0002, 0x0080, 0x0100
 IMAGE_ICON = 1
 LR_LOADFROMFILE = 0x0010
 SM_CXSMICON, SM_CYSMICON = 49, 50
 CMD_QUIT = 1
+CMD_TOGGLE_KEYBOARD = 2
+CMD_POSITION_BASE = 100  # + index into POSITIONS
 
 LRESULT = ctypes.c_ssize_t
 WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
@@ -105,14 +111,30 @@ def load_small_icon() -> wintypes.HICON:
     return icon
 
 
-class TrayIcon(threading.Thread):
-    """Calls `on_quit` (from this thread) when the user picks 結束 in the tray menu."""
+def command_for_position(position: str) -> int:
+    return CMD_POSITION_BASE + list(POSITIONS).index(position)
 
-    def __init__(self, tooltip: str, menu_lines: list[str], on_quit: Callable[[], None]) -> None:
+
+def position_for_command(cmd: int) -> str | None:
+    index = cmd - CMD_POSITION_BASE
+    keys = list(POSITIONS)
+    return keys[index] if 0 <= index < len(keys) else None
+
+
+class TrayIcon(threading.Thread):
+    """Right-click menu: toggle the virtual keyboard, pick a screen corner, quit.
+
+    `get_state()` supplies {"keyboard": bool, "position": str} so the menu shows check marks;
+    `on_command(name, value)` receives "toggle_keyboard", ("position", <key>) or "quit".
+    """
+
+    def __init__(self, tooltip: str, menu_lines: list[str], on_command: Callable[[str, str | None], None],
+                 get_state: Callable[[], dict] = dict) -> None:
         super().__init__(name="tray-icon", daemon=True)
         self.tooltip = tooltip
         self.menu_lines = menu_lines
-        self.on_quit = on_quit
+        self.on_command = on_command
+        self.get_state = get_state
         self.hwnd = None
         self.added = False
         self.ready = threading.Event()
@@ -185,6 +207,15 @@ class TrayIcon(threading.Thread):
         for line in self.menu_lines:
             user32.AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, line)
         user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        state = self.get_state()
+        checked = MF_CHECKED if state.get("keyboard") else 0
+        user32.AppendMenuW(menu, MF_STRING | checked, CMD_TOGGLE_KEYBOARD, "顯示小鍵盤")
+        positions = user32.CreatePopupMenu()
+        for key, name in POSITIONS.items():
+            checked = MF_CHECKED if state.get("position") == key else 0
+            user32.AppendMenuW(positions, MF_STRING | checked, command_for_position(key), name)
+        user32.AppendMenuW(menu, MF_STRING | MF_POPUP, positions, "顯示位置")
+        user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         user32.AppendMenuW(menu, MF_STRING, CMD_QUIT, "結束 Key Overlay")
         pt = wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
@@ -192,9 +223,13 @@ class TrayIcon(threading.Thread):
         cmd = user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_RETURNCMD,
                                     pt.x, pt.y, 0, self.hwnd, None)
         user32.PostMessageW(self.hwnd, WM_NULL, 0, 0)
-        user32.DestroyMenu(menu)
+        user32.DestroyMenu(menu)  # also destroys the positions submenu
         if cmd == CMD_QUIT:
-            self.on_quit()
+            self.on_command("quit", None)
+        elif cmd == CMD_TOGGLE_KEYBOARD:
+            self.on_command("toggle_keyboard", None)
+        elif (position := position_for_command(cmd)) is not None:
+            self.on_command("position", position)
 
     def _wndproc(self, hwnd, msg, w_param, l_param):
         if msg == WM_TRAY and (l_param & 0xFFFF) in (WM_LBUTTONUP, WM_RBUTTONUP):

@@ -79,6 +79,10 @@ class KeyState:
     def empty(self) -> bool:
         return not self._held
 
+    def held_vks(self) -> frozenset[int]:
+        """Raw virtual-key codes currently held (left/right modifiers kept distinct)."""
+        return frozenset(self._held)
+
     def labels(self) -> list[str]:
         held = sorted(self._held, key=lambda vk: self._held[vk][0])
         mods = {MODIFIER_VKS[vk] for vk in held if is_modifier(vk)}
@@ -93,6 +97,14 @@ class KeyState:
     def has_command_modifier(self) -> bool:
         """True when Ctrl/Alt/Win is held, i.e. the keys form a shortcut rather than typing."""
         return any(MODIFIER_VKS.get(vk) in ("Ctrl", "Alt", "Win") for vk in self._held)
+
+    def should_display(self, combos_only: bool) -> bool:
+        """combos-only mode keeps plain typing (e.g. passwords) off the screen."""
+        return not combos_only or self.has_command_modifier()
+
+    def visible_vks(self, combos_only: bool) -> frozenset[int]:
+        """Keys the virtual keyboard may light up under the same privacy rule."""
+        return self.held_vks() if self.should_display(combos_only) else frozenset()
 
 
 def format_combo(labels: list[str]) -> str:
